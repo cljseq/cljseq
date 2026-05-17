@@ -1,3 +1,8 @@
+> **This repository has been archived.**
+> Development has moved to [nomos-studio/nous](https://github.com/nomos-studio/nous).
+
+---
+
 # cljseq
 
 A music-theory-aware Clojure sequencer for live coding. Runs at a Clojure
