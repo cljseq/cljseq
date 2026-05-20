@@ -46,6 +46,9 @@ Version 0.14.0 · April 2026
 38. [Arpeggiator (`cljseq.arp`)](#38-arpeggiator-cljseqarp)
 39. [Reference: REPL Commands and Step Keys](#39-reference)
 40. [Browser Control Surface (`cljseq-ui`)](#40-browser-control-surface)
+41. [Step Sequencer Protocol (`cljseq.seq`)](#41-step-sequencer-protocol-cljseqseq)
+42. [Pattern × Rhythm Motifs (`cljseq.pattern`)](#42-pattern--rhythm-motifs-cljseqpattern)
+43. [Transaction Journal (`cljseq.journal`)](#43-transaction-journal-cljseqjournal)
 
 ---
 
@@ -800,45 +803,67 @@ The CLJS source lives in `src/cljseq_ui/core.cljs`. It uses only the native
 ### Stochastic sequences
 
 ```clojure
-(require '[cljseq.stochastic :as stoch])
+(require '[cljseq.stochastic :as stoch]
+         '[cljseq.seq        :as sq])
 
-;; Build a stochastic generator context for a scale
-(def gen (stoch/make-stochastic-context
-           {:scale (make-scale :C 4 :dorian) :density 0.7}))
+;; Build a stochastic generator context
+(defstochastic marble
+  {:channels 2 :x-spread 0.6 :x-bias 0.5 :t-bias 0.7})
 
-;; Advance and play
-(deflive-loop :stoch-melody {}
-  (when-let [note (stoch/next-x! gen)]
-    (play! note))
-  (sleep! 1/4))
+;; IStepSequencer wrapper — use run-step! inside a live-loop
+(def marble-seq (stoch/make-stochastic-seq marble :ch 0 :clock-div 1/8 :vel 90))
+
+(deflive-loop :marble-melody {}
+  (run-step! marble-seq))
+
+;; Or draw pitch / gate manually:
+(deflive-loop :marble-manual {}
+  (when (stoch/next-t! marble 0)
+    (play! {:pitch/midi (stoch/next-x! marble 0) :dur/beats 1/16}))
+  (sleep! 1/8))
 
 ;; Euclidean rhythm pattern
 (stoch/stochastic-rhythm {:pulses 5 :steps 16})
 ;; => [1 0 0 1 0 0 1 0 0 1 0 0 1 0 0 0]
 ```
 
+`make-stochastic-seq` options: `:ch` (channel 0-based), `:vel`, `:clock-div`
+(step duration, default `1/8`), `:gate` (gate fraction, default `0.9`).
+`seq-cycle-length` returns nil — drive via `run-step!`, not `run-cycle!`.
+
 ### Fractal sequences
 
 ```clojure
-(require '[cljseq.fractal :as fractal])
+(require '[cljseq.fractal :as frac]
+         '[cljseq.seq     :as sq])
 
-;; Build a fractal context: a C-major trunk with a transposed and reversed variant
-(def fctx
-  (atom (fractal/make-fractal-context
-          {:trunk      [{:pitch/midi 60 :dur/beats 1/4}   ; C4
-                        {:pitch/midi 64 :dur/beats 1/4}   ; E4
-                        {:pitch/midi 67 :dur/beats 1/4}   ; G4
-                        {:pitch/midi 71 :dur/beats 1/2}]  ; B4
-           :transforms [:reverse :transpose]
-           :root       60
-           :transpose-semitones 7})))   ; up a fifth
+;; Define a fractal context with deffractal
+(deffractal melody
+  {:trunk      [{:pitch/midi 60 :dur/beats 1/4 :gate/on? true :gate/len 0.7}
+                {:pitch/midi 64 :dur/beats 1/4 :gate/on? true :gate/len 0.7}
+                {:pitch/midi 67 :dur/beats 1/4 :gate/on? true :gate/len 0.7}
+                {:pitch/midi 71 :dur/beats 1/2 :gate/on? true :gate/len 0.8}]
+   :transforms [:reverse :transpose]
+   :root       60
+   :transpose-semitones 7})
 
-;; Advance step-by-step in a live loop
+;; IStepSequencer wrapper — run-step! drives one step per call (infinite source)
+(def mel-seq (frac/make-fractal-seq melody :vel 95))
+
 (deflive-loop :fractal-mel {}
-  (when-let [step (fractal/next-step! fctx)]
-    (play! step))
-  (sleep! 1/4))
+  (run-step! mel-seq))
+
+;; Or use the raw next-step! API for manual control:
+(deflive-loop :fractal-manual {}
+  (when-let [step (frac/next-step! melody)]
+    (when (:gate/on? step)
+      (play! step)))
+  (sleep! (:dur/beats step 1/4)))
 ```
+
+`make-fractal-seq` option: `:vel` (default 100). Steps with `:gate/on? false`
+are returned as rest events. `seq-cycle-length` returns nil — always use
+`run-step!`, not `run-cycle!`.
 
 ### Conductor arcs
 
@@ -3671,46 +3696,84 @@ body or a background thread.
 
 ### Looping arps
 
-```clojure
-;; Start a looping arp; returns a loop-id atom
-(def my-arp (arp-loop! :alberti [60 64 67] :vel 90))
+`ArpState` implements `IStepSequencer` (§41), so `seq-loop!` from `cljseq.seq`
+is the standard way to run it in the background:
 
-;; Stop it
-(arp-stop! my-arp)
+```clojure
+(def my-state (make-arp-state :alberti [60 64 67] :vel 90))
+
+;; Start a background looping arp
+(def handle (seq-loop! my-state))
+
+;; Stop it (after current cycle completes)
+(stop-seq! handle)
 ```
 
-`arp-loop!` returns a self-contained handle map — no global loop registry.
-The handle holds the `:running?` atom and the background `:future` directly.
-Each call to `arp-loop!` starts a background future that calls `arp-play!` in
-a tight loop. Tempo changes via `set-bpm!` take effect at the next cycle
-boundary.
+`seq-loop!` returns `{:running? atom :future f}` — no global loop registry.
+Tempo changes via `set-bpm!` take effect at the next cycle boundary.
 
 ### Step-by-step engine (live-loop integration)
 
-For fine-grained control inside a `deflive-loop`, use the stateful step engine:
+`ArpState` is an `IStepSequencer` — use `run-cycle!` to play one full
+pattern cycle inside a `deflive-loop`:
 
 ```clojure
-;; Create an arp state atom
-(def my-state (make-arp-state :montuno [60 64 67 70] :vel 95))
+(def my-arp (make-arp-state :montuno [60 64 67 70] :vel 95))
 
-;; Inside a live-loop:
-(deflive-loop :bass-arp []
-  (let [{:keys [pitch/midi dur/beats beats]} (next-arp-step! my-state)]
-    (when midi
-      (play! {:pitch/midi midi :dur/beats dur/beats :mod/velocity 95}))
-    (sleep! beats)))
+(deflive-loop :bass-arp {}
+  (run-cycle! my-arp))
 ```
 
-`next-arp-step!` returns:
+To change the chord voicing between cycles without resetting the step position:
 
-| Key | Present | Value |
-|-----|---------|-------|
-| `:pitch/midi` | note steps only | MIDI note to play |
-| `:dur/beats` | note steps only | Gate duration in beats |
-| `:beats` | always | Step duration (advance clock by this) |
-| `:vel` | always | Velocity from make-arp-state |
+```clojure
+(deflive-loop :bass-arp {}
+  (reset-arp-chord! my-arp (next-chord!))
+  (run-cycle! my-arp))
+```
 
-Rest steps return only `:beats` and `:vel` — no `:pitch/midi`.
+For manual step-by-step control use `next-event` from `cljseq.seq`:
+
+```clojure
+(let [{:keys [event beats]} (sq/next-event my-arp)]
+  ;; event is a standard note map {:pitch/midi N :dur/beats D :mod/velocity V}
+  ;; or nil for rest steps
+  (when event (play! event))
+  (sleep! beats))
+```
+
+### Parameter locks
+
+Both pattern formats support per-step parameter overrides that are merged
+into the note map before dispatch.
+
+**`:chord` patterns** — add a `:params` vector parallel to `:order`:
+
+```clojure
+(arp-register! :filtered-bounce
+  {:type   :chord
+   :order  [0 1 2 1]
+   :rhythm [1 1/2 1/2 1]
+   :dur    3/4
+   :params [{} {:mod/cutoff 127} {:mod/cutoff 64} {}]})
+   ;; step 1 opens filter; step 2 at mid; steps 0/3 unchanged
+```
+
+**`:phrase` patterns** — extra keys in a step map are locks automatically:
+
+```clojure
+{:type  :phrase
+ :steps [{:semi 0 :beats 1 :mod/cutoff 64}
+          {:semi 4 :beats 1 :mod/cutoff 127}
+          {:semi 7 :beats 1}
+          {:rest true :beats 1}]}
+;; :pitch/microtone for Iridium MkII / Hydrasynth MTS per-step inflection:
+;;   {:semi 3 :beats 1 :pitch/microtone -17}  ; 17 cents flat
+```
+
+Locked values flow through the standard ctrl binding dispatch in `core/play!`
+— if `:mod/cutoff` is bound to a MIDI CC via `ctrl/bind!`, the CC fires
+before the note-on automatically.
 
 ### Custom patterns
 
@@ -3884,6 +3947,361 @@ The control surface is Step 2 of a planned web UI sequence:
 Steps 1 and 2 are complete. The control surface at Step 2 is a general-purpose
 ctrl-tree observer; Step 3 will add device-specific panels generated from the
 device model data.
+
+---
+
+## 41. Step Sequencer Protocol (`cljseq.seq`)
+
+`cljseq.seq` defines the `IStepSequencer` protocol — the common interface
+that all step-based note generators in cljseq implement. It provides a
+uniform way to drive `ArpState`, `MotifState`, `FractalSeq`, `StochasticSeq`,
+and any custom sequencer you write.
+
+### Protocol
+
+```clojure
+(defprotocol IStepSequencer
+  (next-event [sq])         ; advance one step → {:event note-map-or-nil :beats N}
+  (seq-cycle-length [sq]))  ; steps per cycle, or nil for infinite/generative
+```
+
+`next-event` returns:
+
+| Return value | Meaning |
+|---|---|
+| `{:event {:pitch/midi N :dur/beats D :mod/velocity V ...} :beats B}` | Play a note; sleep `:beats` |
+| `{:event nil :beats B}` | Rest; sleep `:beats` only |
+
+`:beats` is always the step clock duration. `:dur/beats` inside the event is
+the gate (note duration ≤ `:beats`). Any extra keys in the event map are
+parameter locks that `play!` routes via ctrl bindings.
+
+### Runners
+
+```clojure
+;; Play one step (for infinite sources inside deflive-loop)
+(run-step! sq)
+(run-step! sq {:xf my-transformer})
+
+;; Play one full cycle (seq-cycle-length steps)
+(run-cycle! sq)
+(run-cycle! sq {:xf my-transformer})
+
+;; Loop indefinitely in background
+(def handle (seq-loop! sq))
+(def handle (seq-loop! sq {:xf my-transformer}))
+(stop-seq! handle)
+```
+
+`run-cycle!` on an infinite source (nil `seq-cycle-length`) delegates to
+`run-step!` — the caller's `deflive-loop` provides the outer loop.
+
+### ITransformer composition
+
+The `:xf` option applies a `cljseq.transform` `ITransformer` to each event
+before dispatch — harmonies, echoes, octave doublings etc.:
+
+```clojure
+(deflive-loop :melody {}
+  (run-cycle! my-motif {:xf (harmonize {:intervals [7]})}))
+```
+
+### Composing sequencers
+
+Because all sources speak the same protocol, they compose:
+
+```clojure
+;; Drive arp chord from a motif — advance harmony once per bar
+(def chord-seq (make-motif-state (named-pattern :up) (named-rhythm :four-on-floor)))
+(def mel-arp   (make-arp-state   :bounce [60 64 67]))
+
+(deflive-loop :comp {}
+  (let [{:keys [event]} (sq/next-event chord-seq)]
+    (when event
+      (reset-arp-chord! mel-arp (:pitch/midi event))))
+  (run-cycle! mel-arp))
+```
+
+### Implementing the protocol on custom types
+
+```clojure
+(defrecord MySeq [notes step-atom])
+
+(extend-protocol sq/IStepSequencer
+  MySeq
+  (next-event [s]
+    (let [i    (mod @(:step-atom s) (count (:notes s)))
+          note (nth (:notes s) i)]
+      (swap! (:step-atom s) inc)
+      {:event {:pitch/midi note :dur/beats 0.4 :mod/velocity 100}
+       :beats 0.5}))
+  (seq-cycle-length [s] (count (:notes s))))
+```
+
+---
+
+## 42. Pattern × Rhythm Motifs (`cljseq.pattern`)
+
+`cljseq.pattern` provides the NDLR-style Pattern × Rhythm motif engine.
+Pattern and Rhythm are orthogonal — they cycle at their own lengths. When
+they differ, the combined phrase repeats every `lcm(len-pat, len-rhy)` steps,
+generating emergent complexity from simple data.
+
+### Constructors
+
+```clojure
+;; Pattern — tagged vector; first element is the type tag
+(pattern [:chord 1 3 5 2 4])        ; chord-relative, 1-indexed
+(pattern [:scale 1 2 3 5 6 8])      ; scale-relative, 1-indexed
+(pattern [:chromatic 0 2 4 7 9])    ; semitone offsets from *harmony-ctx* root
+(pattern [:pitch :C4 :E4 :G4])      ; absolute pitches
+(pattern [:midi  60  64  67])       ; raw MIDI integers
+
+;; Rhythm — velocity vector; nil=rest, :tie=hold
+(rhythm [100 nil 80 nil])
+(rhythm [127 :tie :tie nil 90])
+
+;; Euclidean rhythm shortcut
+(rhythm-from-euclid 3 8)         ; tresillo: 3 onsets in 8 steps
+(rhythm-from-euclid 5 8 90)      ; 5 in 8, velocity 90
+(rhythm-from-euclid 5 8 100 1)   ; rotated by 1 position
+```
+
+### One-shot playback with `motif!`
+
+`motif!` plays one full `lcm(pat-len, rhy-len)` cycle. Call from a
+`deflive-loop` body.
+
+```clojure
+(deflive-loop :melody {:harmony (scale :C 4 :major)
+                       :chord   (chord :C 4 :maj7)}
+  (motif! (named-pattern :bounce)
+          (named-rhythm  :tresillo)
+          {:clock-div 1/8}))
+```
+
+Options:
+
+| Option | Default | Description |
+|---|---|---|
+| `:clock-div` | `1/8` | Duration per step in beats |
+| `:gate` | `0.9` | Note duration as fraction of `:clock-div` |
+| `:probability` | `1.0` | Per-note fire probability 0.0–1.0 |
+| `:channel` | nil | MIDI channel override |
+| `:locks` | nil | `Locks` record for parameter overrides |
+| `:xf` | nil | `ITransformer` applied to each event |
+
+### Stateful step engine with `make-motif-state`
+
+`make-motif-state` returns a `MotifState` that implements `IStepSequencer`,
+usable with all `cljseq.seq` runners:
+
+```clojure
+(def my-motif
+  (make-motif-state (named-pattern :bounce)
+                    (named-rhythm  :tresillo)
+                    :clock-div 1/8
+                    :gate 0.8))
+
+;; Inside a live-loop — identical to motif! but the state persists across iterations
+(deflive-loop :melody {:harmony (scale :C 4 :dorian)}
+  (run-cycle! my-motif))
+
+;; Loop in background
+(def handle (seq-loop! my-motif))
+(stop-seq! handle)
+```
+
+`seq-cycle-length` returns `lcm(pat-len, rhy-len)` — or the three-way lcm
+`lcm(lcm(pat, rhy), locks-len)` when a `Locks` record is attached.
+
+### Parameter locks with `Locks`
+
+```clojure
+;; Locks cycle independently; a 4-step Locks against a 5-note Pattern and
+;; 3-step Rhythm repeats every lcm(4,5,3) = 60 steps.
+(def my-locks
+  (locks [{:mod/cutoff 64}
+          {}
+          {:mod/cutoff 127 :mod/resonance 80}
+          {}]))
+
+(def my-motif
+  (make-motif-state (pattern [:chord 1 3 5])
+                    (rhythm   [100 nil 80])
+                    :locks my-locks
+                    :clock-div 1/8))
+```
+
+Or pass directly to `motif!`:
+
+```clojure
+(motif! (named-pattern :zigzag)
+        (named-rhythm  :offbeat)
+        {:clock-div 1/8
+         :locks (locks [{} {:mod/cutoff 127} {} {}])})
+```
+
+### Pattern transformations
+
+```clojure
+(reverse-pattern   p)          ; reverse selector order
+(rotate-pattern    p 2)        ; cyclic shift right by 2 steps
+(transpose-pattern p 2)        ; add 2 to all numeric indices
+(invert-pattern    p)          ; reflect around min+max of indices
+```
+
+Compose transformations for live variation:
+
+```clojure
+(deflive-loop :melody {:harmony (scale :C 4 :minor)}
+  (motif! (-> (named-pattern :bounce) (rotate-pattern @bar-count))
+          (named-rhythm :tresillo)
+          {:clock-div 1/8}))
+```
+
+### Named pattern library
+
+Built-in chord patterns: `:up`, `:down`, `:bounce`, `:alberti`, `:waltz-bass`,
+`:broken-triad`, `:guitar-pick`, `:stride`, `:raga-alap`, `:root-fifth`,
+`:root-octave`, `:shell-up`, `:shell-down`, `:montuno`.
+
+Built-in scale patterns: `:scale-up`, `:scale-down`, `:scale-bounce`,
+`:pentatonic`, `:zigzag`, `:thirds-up`, `:peak`.
+
+Built-in chromatic patterns: `:chromatic-4`, `:chromatic-bl` (blues hexatonic).
+
+```clojure
+(pattern-names)   ; sorted list of all built-in names
+(named-pattern :bounce)
+```
+
+### Named rhythm library
+
+Built-in rhythms: `:tresillo`, `:cinquillo`, `:son-clave`, `:rumba-clave`,
+`:bossa-nova`, `:four-on-floor`, `:straight-8`, `:straight-16`, `:euclid-5-16`,
+`:euclid-7-16`, `:offbeat`, `:onbeat`, `:syncopated`, `:habanera`, `:waltz`,
+`:shuffle`.
+
+```clojure
+(rhythm-names)    ; sorted list of all built-in names
+(named-rhythm :tresillo)
+```
+
+### Pitch resolution
+
+| Pattern type | How pitches resolve |
+|---|---|
+| `:chord` | `*chord-ctx*` — set via `use-chord!` or the `:chord` option on `deflive-loop`. 1-indexed; index beyond chord size wraps upward by octave. |
+| `:scale` | `*harmony-ctx*` — set via `use-harmony!` or the `:harmony` option. 1-indexed; wraps via `IScale/pitch-at`. |
+| `:chromatic` | `*harmony-ctx*` root — integer semitone offset; 0=root, negative ok. |
+| `:pitch` | Keywords (`:C4`), `Pitch` records, or MIDI integers — resolved absolutely. |
+| `:midi` | Raw MIDI integers — no context needed. |
+
+---
+
+## 43. Transaction Journal (`cljseq.journal`)
+
+Every parameter write goes through the sidecar, which appends a row to a
+WAL-mode SQLite `changes` table. `cljseq.journal` reads and queries that log
+from Clojure, with no IPC round-trip — it opens the file directly via
+`sqlite-jdbc`.
+
+### Layer 1 — reading the raw log
+
+```clojure
+(def txs (read-journal "/path/to/session.sqlite"))
+;; => [{:tx/id #uuid "..." :tx/beat 0.0 :tx/wall-ns 1234 :tx/source :schema
+;;      :tx/path [:cljseq/schema :device-models :arp2600]
+;;      :tx/before nil :tx/after {...} :tx/parent nil} ...]
+```
+
+`read-journal` seals all persistence artifacts at the boundary: source
+integers → keywords (`:user`, `:loop`, `:trajectory`, etc.), EDN strings →
+Clojure data, `tx_id` bytes → `java.util.UUID`. Everything above this call
+sees only Clojure data.
+
+### Layer 2 — query functions
+
+All L2 functions take the vector from `read-journal` as their first argument.
+
+```clojure
+;; All writes to a path, chronological
+(tx-history txs [:arp2600 :filter :cutoff])
+;; => [{:tx/beat 1.0 :tx/after 0.5 ...} ...]
+
+;; Value at a given beat (last write ≤ beat)
+(tx-at txs [:arp2600 :filter :cutoff] 20.0)
+;; => 0.8
+
+;; Writes in a beat window; optional :source / :path filters
+(tx-range txs 64.0 128.0 :source :user)
+
+;; All writes attributed to one source
+(tx-by-source txs :loop)
+
+;; Set of paths written at least once
+(active-paths (tx-range txs 64.0 128.0))
+
+;; Final state fold
+(latest-values txs)
+;; => {[:arp2600 :filter :cutoff] 0.6 ...}
+```
+
+### Layer 3 — semantic transforms
+
+#### `crystallize` — performance window to timeline
+
+```clojure
+(crystallize txs 64.0 128.0 :source :loop)
+;; => {[:arp2600 :filter :cutoff] [{:beat 0.0 :value 0.5}
+;;                                  {:beat 16.0 :value 0.8}]}
+```
+
+Beats are normalized relative to `beat-from`, so beat 64 → 0.0. Use this
+to turn a live-performance window into trajectory or step-sequence material.
+
+Options:
+- `:source` — restrict to one source kind keyword
+- `:schema?` — include `[:cljseq/schema ...]` paths (default `false`)
+
+#### `diff-sessions` — compare two journal files
+
+```clojure
+(diff-sessions "tuesday.sqlite" "thursday.sqlite")
+;; => {:added     {[:synth :lfo :rate] 2.0}
+;;     :removed   {}
+;;     :changed   {[:arp2600 :filter :cutoff] {:before 0.5 :after 0.7}}
+;;     :unchanged #{[:arp2600 :filter :res]}}
+```
+
+### Session lifecycle
+
+Four functions in `cljseq.core` (re-exported via `cljseq.user`) wrap the
+journal for session save/restore:
+
+| Function | Description |
+|---|---|
+| `export-session!` | Write live ctrl/schema tree to a `.cljseq` EDN file |
+| `restore-session!` | Load a `.cljseq` file and re-apply BPM, devices, params |
+| `export-from-journal!` | Reconstruct final state from a SQLite file → `.cljseq` |
+| `load-session!` | Open a SQLite journal and restore final state in-process |
+
+```clojure
+;; Save the current session
+(export-session! "friday-ambient.cljseq")
+
+;; Restore it next session
+(restore-session! "friday-ambient.cljseq")
+
+;; Or rebuild from the raw journal if you forgot to export
+(export-from-journal! "/path/to/session.sqlite" "friday-ambient.cljseq")
+(load-session! "/path/to/session.sqlite")
+```
+
+The `.cljseq` export format is fully-qualified, human-readable Clojure forms
+(`cljseq.schema/defdevice-model`, `cljseq.ctrl/set!`, etc.) — diff-friendly
+and safe to commit to version control.
 
 ---
 

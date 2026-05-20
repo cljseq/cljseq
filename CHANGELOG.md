@@ -10,6 +10,159 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.16.0] — 2026-04-21
+
+### Added
+
+#### SQLite transaction log (durability layer)
+
+- **WAL-mode SQLite journal** — the sidecar now writes every `ctrl/set!` and
+  `ctrl/send!` as a row in a `changes` table (beat, wall-ns, source kind,
+  path, before, after). Survives process restarts; zero write-amplification on
+  the hot path.
+- **`source-kind` vocabulary** — canonical `source-kind->int` / `int->source-kind`
+  maps in `cljseq.journal`; shared by sidecar write path and journal read path.
+  Source kinds: `:user`, `:loop`, `:input`, `:trajectory`, `:watcher`,
+  `:supervisor`, `:schema`, `:undo`, `:error`.
+
+#### Session lifecycle
+
+- **`export-session!`** — write the live ctrl/schema tree to a `.cljseq` EDN
+  file as fully-qualified, human-readable Clojure forms. VCS-friendly; can be
+  opened in any editor and edited before replay.
+- **`restore-session!`** — load a `.cljseq` file and re-apply it: BPM,
+  beats-per-bar, device models, realizations, active realizations, and all
+  parameter writes via direct function calls (no eval).
+- **`export-from-journal!`** — reconstruct the final parameter state from a
+  SQLite journal file and write it as a `.cljseq` export. Useful when the
+  live session was never explicitly exported.
+- **`load-session!`** — open a SQLite journal and restore the final state into
+  the running JVM without writing an intermediate file.
+
+#### `cljseq.journal` — transaction journal query API
+
+- **Layer 1 — `read-journal`** — decode a SQLite journal file to a vector of
+  `:tx/`-namespaced maps. All persistence artifacts are sealed at this
+  boundary: source integers → keywords, EDN strings → Clojure data,
+  tx_id bytes → `java.util.UUID`.
+  Shape: `{:tx/id :tx/beat :tx/wall-ns :tx/source :tx/path :tx/before :tx/after :tx/parent}`
+- **Layer 2 — query functions** (operate on the vector from `read-journal`):
+  - `tx-history` — all writes to a path in chronological order
+  - `tx-at` — value of a path at a given beat (last write ≤ beat)
+  - `tx-range` — writes in a beat window; optional `:source` / `:path` filters
+  - `tx-by-source` — writes attributed to one source kind keyword
+  - `active-paths` — set of paths written at least once
+  - `latest-values` — `{path → last-written-value}` fold
+- **Layer 3 — semantic transforms**:
+  - `crystallize` — extract a beat window as `{path [{:beat N :value v} ...]}`,
+    beats normalized relative to `beat-from`. Options: `:source`, `:schema?`.
+    Turns a live performance window into trajectory or step-sequence material.
+  - `diff-sessions` — compare final parameter state of two SQLite files;
+    returns `{:added :removed :changed :unchanged}`.
+
+#### `cljseq.seq` — unified IStepSequencer protocol
+
+- **`IStepSequencer` protocol** — single interface for all step-based note
+  generators in cljseq. Two operations:
+  - `(next-event sq)` → `{:event note-map-or-nil :beats duration}` — advance
+    one step; `:event nil` means rest.
+  - `(seq-cycle-length sq)` → long (steps per cycle) or nil (infinite/generative).
+- **`run-step! sq`** — play one step and sleep `:beats`; for infinite/generative
+  sources where the caller controls pacing.
+- **`run-cycle! sq`** — play one full cycle (`seq-cycle-length` steps); falls
+  through to `run-step!` for infinite sources.
+- **`seq-loop! sq`** — start a background indefinitely-looping future; returns
+  `{:running? atom :future f}`.
+- **`stop-seq! handle`** — signal stop and cancel the future.
+- Both `run-cycle!` and `run-step!` accept `{:xf transformer}` — applies an
+  `ITransformer` (from `cljseq.transform`) to each event before dispatch.
+
+#### `cljseq.arp` — ArpState rewrite + parameter locks
+
+- **`ArpState` defrecord** — replaces the plain atom returned by the old
+  `make-arp-state`. Implements `IStepSequencer` directly; use with any of the
+  `cljseq.seq` runners.
+- **`make-arp-state`** — updated factory; now returns an `ArpState` record.
+  Same arguments and options (`:vel`, `:oct`, `:rate`) as before.
+- **`reset-chord!`** — update the chord voicing of a running `ArpState` without
+  resetting the step position. Useful for changing harmony mid-loop.
+- **Per-step parameter locks** — both pattern formats now support arbitrary
+  key overrides per step:
+  - `:chord` patterns: add a `:params` vector parallel to `:order`/`:rhythm`.
+    `{}` or `nil` = no lock; any keys in the map are merged into that step's
+    note map before dispatch.
+    ```clojure
+    {:type   :chord
+     :order  [0 1 2 1 0]
+     :rhythm [1 1/2 1/2 1 1]
+     :params [{} {:mod/cutoff 127} {} {:mod/resonance 32} {}]}
+    ```
+  - `:phrase` patterns: extra keys in any step map are automatically parameter
+    locks — just add them alongside `:semi` and `:beats`:
+    ```clojure
+    {:semi 4 :beats 1 :mod/cutoff 127 :pitch/microtone 17}
+    ```
+- **`:mod/velocity` normalisation** — `next-event` now returns `:mod/velocity`
+  (standard note map key) instead of the non-standard `:vel` that `next-step!`
+  used to return.
+- **`play!`** — unchanged convenience one-shot; internally uses `run-cycle!`.
+
+#### `cljseq.pattern` — MotifState + Locks (IStepSequencer for Pattern×Rhythm motifs)
+
+- **`Locks` defrecord** — per-step parameter override data, cycling
+  independently of `Pattern` and `Rhythm`. A 4-step `Locks` against a 5-note
+  `Pattern` and a 3-step `Rhythm` repeats every `lcm(4,5,3) = 60` steps.
+- **`locks [v]`** — constructor. `v` is a vector of maps; `nil`/`{}` = no lock.
+- **`MotifState` defrecord** — `Pattern` × `Rhythm` × optional `Locks` as an
+  `IStepSequencer`. Implements `next-event` (samples `*harmony-ctx*` /
+  `*chord-ctx*` at step time) and `seq-cycle-length` (three-way lcm when
+  `Locks` are provided).
+- **`make-motif-state pat rhy & opts`** — factory. Options: `:locks`,
+  `:clock-div` (default `1/8`), `:gate` (default `0.9`), `:probability`
+  (default `1.0`), `:channel`.
+- **`motif!`** — refactored as a thin wrapper over `make-motif-state` +
+  `run-cycle!`. Accepts the same options as before, plus `:locks` and `:xf`.
+  Behaviour is identical to the previous implementation.
+
+#### `cljseq.fractal` — FractalSeq (IStepSequencer wrapper)
+
+- **`FractalSeq` defrecord** — wraps a fractal context atom as an
+  `IStepSequencer`. `seq-cycle-length` returns nil (infinite). Use with
+  `run-step!` inside `deflive-loop`.
+- **`make-fractal-seq ctx-atom & {:keys [vel]}`** — factory. `:vel` sets
+  the default velocity injected into each step event (default 100). Steps
+  with `:gate/on? false` are returned as rest events (`{:event nil}`).
+
+#### `cljseq.stochastic` — StochasticSeq (IStepSequencer wrapper)
+
+- **`StochasticSeq` defrecord** — wraps a stochastic context as an
+  `IStepSequencer`. `seq-cycle-length` returns nil (infinite). Use with
+  `run-step!` inside `deflive-loop`.
+- **`make-stochastic-seq gen & opts`** — factory. Options: `:ch` (channel
+  index 0-based, default 0), `:vel` (default 100), `:clock-div` (default
+  `1/8`), `:gate` (default `0.9`). Draws `next-t!` (gate) then `next-x!`
+  (pitch) per step.
+
+#### Web control surface Tier 3 (`cljseq-ui`)
+
+- **Beat pulse** — single dot in the header alternates bright/dim on every beat,
+  synced to the running BPM via client-side `setInterval`.
+- **Level-meter sliders** — ctrl-tree value sliders render as filled bars
+  (inline `linear-gradient` track fill) so the current value reads at a glance.
+- **XY pad** — dual-axis controller; drag sends two ctrl-tree paths
+  simultaneously. Configurable path pair via dropdowns.
+
+### Changed
+
+- **`cljseq.arp`** — `arp-loop!`, `stop-arp!`, and `next-step!` removed.
+  Replaced by `seq-loop!`, `stop-seq!`, and `next-event` from `cljseq.seq`.
+  `user.clj` exports updated accordingly; `reset-arp-chord!` added.
+- **`motif!`** — now delegates to `MotifState` + `run-cycle!` internally.
+  The external signature and behaviour are unchanged; `:xf` and `:locks`
+  options added.
+
+---
+
 ## [0.15.0] — 2026-04-17
 
 ### Added
@@ -1081,7 +1234,19 @@ Linux (Ubuntu Studio, Fedora) and device CC map verification are targeted for 0.
 
 ---
 
-[Unreleased]: https://github.com/rodgert/cljseq/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/rodgert/cljseq/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/rodgert/cljseq/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/rodgert/cljseq/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/rodgert/cljseq/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/rodgert/cljseq/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/rodgert/cljseq/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/rodgert/cljseq/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/rodgert/cljseq/compare/v0.9.1...v0.10.0
+[0.9.1]: https://github.com/rodgert/cljseq/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/rodgert/cljseq/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/rodgert/cljseq/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/rodgert/cljseq/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/rodgert/cljseq/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/rodgert/cljseq/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/rodgert/cljseq/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rodgert/cljseq/compare/v0.2.0...v0.3.0
